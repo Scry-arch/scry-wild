@@ -267,15 +267,23 @@ pub(crate) trait ElfSymbol:
     type Class: ElfClass;
 }
 
-#[derive(Debug, Copy, Clone, Default)]
-pub(crate) struct Class64;
+duplicate::duplicate! {
+    [
+        class     file_header    sym;
+        [Class32] [FileHeader32] [Sym32];
+        [Class64] [FileHeader64] [Sym64];
+    ]
 
-impl ElfClass for Class64 {
-    type FileHeader = object::elf::FileHeader64<LittleEndian>;
-}
+    #[derive(Debug, Copy, Clone, Default)]
+    pub(crate) struct class;
 
-impl ElfSymbol for object::elf::Sym64<LittleEndian> {
-    type Class = Class64;
+    impl ElfClass for class {
+        type FileHeader = object::elf::file_header<LittleEndian>;
+    }
+
+    impl ElfSymbol for object::elf::sym<LittleEndian> {
+        type Class = class;
+    }
 }
 
 pub(crate) type FileHeader<C> = <C as ElfClass>::FileHeader;
@@ -289,6 +297,7 @@ pub(crate) type CompressionHeaderEntry<C> =
 pub(crate) type Rela<C> = <FileHeader<C> as object::read::elf::FileHeader>::Rela;
 pub(crate) type Relr<C> = <FileHeader<C> as object::read::elf::FileHeader>::Relr;
 pub(crate) type NoteHeader<C> = <FileHeader<C> as object::read::elf::FileHeader>::NoteHeader;
+pub(crate) type FileHeader32 = FileHeader<Class32>;
 pub(crate) type FileHeader64 = FileHeader<Class64>;
 pub(crate) type GnuHashHeader = object::elf::GnuHashHeader<LittleEndian>;
 pub(crate) type Verdef = object::elf::Verdef<LittleEndian>;
@@ -3065,6 +3074,20 @@ fn load_glibc_abi_dt_relr_version<C: ElfClass>(
 
 impl<'data, C: ElfClass> File<'data, C> {
     fn parse_elf_bytes(data: &'data [u8], is_dynamic: bool) -> Result<Self> {
+        // The object crate rejects a header of the wrong class with a generic "unsupported"
+        // error, so check the class ourselves first in order to give a useful message.
+        if let Some(&class) = data.get(EI_CLASS) {
+            let class = object::elf::FileClass(class);
+            let expected = <C::FileHeader as WritableFileHeader>::CLASS;
+            if class != expected {
+                bail!(
+                    "Input is {} but the output is {}",
+                    elf_class_name(class),
+                    elf_class_name(expected)
+                );
+            }
+        }
+
         let header = C::FileHeader::parse(data)?;
         let endian = header.endian()?;
         let architecture = header.e_machine(endian).try_into()?;
@@ -3870,7 +3893,26 @@ fn compute_version_mapping(
     out
 }
 
-impl platform::SectionHeader for object::elf::SectionHeader64<LittleEndian> {
+/// Byte offsets within the ELF identification bytes at the start of every ELF file. These are the
+/// same for both ELF classes, which is what makes it possible to determine the class in the first
+/// place.
+pub(crate) const EI_CLASS: usize = 4;
+pub(crate) const EI_DATA: usize = 5;
+pub(crate) const EI_NIDENT: usize = 16;
+
+/// Returns a human-readable name for an ELF class, for use in error messages.
+pub(crate) fn elf_class_name(class: object::elf::FileClass) -> Cow<'static, str> {
+    match class {
+        object::elf::ELFCLASS32 => Cow::Borrowed("ELF32"),
+        object::elf::ELFCLASS64 => Cow::Borrowed("ELF64"),
+        other => Cow::Owned(format!("ELF with unknown class {}", other.0)),
+    }
+}
+
+/// Section header predicates are the same for both ELF classes, since the object crate widens
+/// the flags and type of 32-bit headers to the same newtypes as 64-bit headers.
+#[duplicate::duplicate_item(section_header; [SectionHeader32]; [SectionHeader64])]
+impl platform::SectionHeader for object::elf::section_header<LittleEndian> {
     fn is_alloc(&self) -> bool {
         self.sh_flags(LittleEndian).is_alloc()
     }
@@ -6821,5 +6863,67 @@ impl SinglePartSectionId {
 impl RegularSectionId {
     const fn output_section_id(self) -> OutputSectionId {
         OutputSectionId::from_u32(ELF_NUM_SINGLE_PART_SECTIONS).offset(self as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elf_object_with_symbol(arch: object::Architecture) -> Vec<u8> {
+        let mut object =
+            object::write::Object::new(object::BinaryFormat::Elf, arch, object::Endianness::Little);
+        let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        let offset = object.append_section_data(text, &[0; 4], 4);
+        object.add_symbol(object::write::Symbol {
+            name: b"foo".to_vec(),
+            value: offset,
+            size: 4,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(text),
+            flags: object::SymbolFlags::None,
+        });
+        object.write().unwrap()
+    }
+
+    #[test]
+    fn parses_elf32_object() {
+        // The x32 ABI produces ELF32 files with an x86-64 machine type, which lets us exercise the
+        // 32-bit parsing path without needing a 32-bit architecture.
+        let bytes = elf_object_with_symbol(object::Architecture::X86_64_X32);
+        let file = File::<Class32>::parse_bytes(&bytes, false).unwrap();
+
+        assert_eq!(file.arch, Architecture::X86_64);
+
+        let (_, section) = file.section_by_name(".text").unwrap();
+        assert_eq!(section.sh_size(LittleEndian), 4);
+
+        // Index 0 is the null symbol, which the object crate refuses to look up.
+        let names = (1..file.num_symbols())
+            .map(|i| {
+                let symbol = file.symbol(object::SymbolIndex(i)).unwrap();
+                file.symbol_name(symbol).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&&b"foo"[..]), "{names:?}");
+    }
+
+    #[test]
+    fn reports_class_mismatch() {
+        let bytes32 = elf_object_with_symbol(object::Architecture::X86_64_X32);
+        let err = File::<Class64>::parse_bytes(&bytes32, false).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Input is ELF32 but the output is ELF64"),
+            "{err:?}"
+        );
+
+        let bytes64 = elf_object_with_symbol(object::Architecture::X86_64);
+        let err = File::<Class32>::parse_bytes(&bytes64, false).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Input is ELF64 but the output is ELF32"),
+            "{err:?}"
+        );
     }
 }

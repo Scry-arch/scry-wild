@@ -517,6 +517,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "duplicate"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e92f10a49176cbffacaedabfaa11d51db1ea0f80a83c26e1873b43cd1742c24"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -838,6 +844,7 @@ dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
  "derive_more",
+ "duplicate",
  "flate2",
  "foldhash 0.2.0",
  "gimli 0.34.0",

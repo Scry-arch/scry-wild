@@ -122,6 +122,9 @@ allow_apis = ["fs", "process"]
 allow_proc_macro = true
 allow_unsafe = true
 
+[pkg.duplicate]
+allow_proc_macro = true
+
 [pkg.clap_derive]
 allow_proc_macro = true
 
