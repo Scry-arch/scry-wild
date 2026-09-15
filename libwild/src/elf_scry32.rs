@@ -230,7 +230,7 @@ mod tests {
     fn parses_scry32_object() {
         let bytes = scry32_object();
         let file = File::<Class32>::parse_bytes(&bytes, false).unwrap();
-        assert_eq!(file.arch, Architecture::Scry32);
+        assert_eq!(file.arch, Some(Architecture::Scry32));
         assert!(file.section_by_name(".text").is_some());
     }
 
@@ -305,6 +305,16 @@ mod tests {
 
     /// Builds a relocatable ELF32 Scry object using the supplied function to populate it.
     fn scry32_object_with(build: impl FnOnce(&mut object::write::Object)) -> Vec<u8> {
+        elf32_object_with(EM_SCRY, build)
+    }
+
+    /// Builds a relocatable ELF32 object tagged with `machine`, using the supplied function to
+    /// populate it. The object crate writes an x32 object (ELF32 with an x86-64 machine number),
+    /// after which the machine number is patched.
+    fn elf32_object_with(
+        machine: object::elf::Machine,
+        build: impl FnOnce(&mut object::write::Object),
+    ) -> Vec<u8> {
         let mut object = object::write::Object::new(
             object::BinaryFormat::Elf,
             object::Architecture::X86_64_X32,
@@ -314,7 +324,7 @@ mod tests {
         let mut bytes = object.write().unwrap();
 
         const E_MACHINE_OFFSET: usize = 18;
-        bytes[E_MACHINE_OFFSET..E_MACHINE_OFFSET + 2].copy_from_slice(&EM_SCRY.0.to_le_bytes());
+        bytes[E_MACHINE_OFFSET..E_MACHINE_OFFSET + 2].copy_from_slice(&machine.0.to_le_bytes());
 
         bytes
     }
@@ -562,5 +572,69 @@ mod tests {
         let err = link(&[caller_object()], &[]).unwrap_err();
         let message = format!("{err:?}");
         assert!(message.contains("helper"), "{message}");
+    }
+
+    /// A machine number that no architecture uses.
+    const FOREIGN_MACHINE: object::elf::Machine = object::elf::Machine(0xfeed);
+
+    /// Builds an archive from the supplied `(member name, contents)` pairs.
+    fn archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = ar::Builder::new(Vec::new());
+        for (name, contents) in members {
+            let header = ar::Header::new(name.as_bytes().to_vec(), contents.len() as u64);
+            builder.append(&header, *contents).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// rustc writes a few objects itself, tagged with whatever machine number it associates with
+    /// the target rather than the one the code objects use. They contain no code, data or
+    /// relocations, so the linker accepts them regardless of their machine number.
+    #[test]
+    fn links_with_architecture_neutral_inputs() {
+        // Like rustc's `symbols.o`: only symbol references.
+        let symbols_object = elf32_object_with(FOREIGN_MACHINE, |object| {
+            object.add_symbol(undefined_symbol("_start"));
+        });
+
+        // Like the metadata members rustc puts in every rlib, alongside the real code object.
+        let metadata_object = elf32_object_with(FOREIGN_MACHINE, |object| {
+            let section = object.add_section(
+                Vec::new(),
+                b".rmeta".to_vec(),
+                object::SectionKind::Metadata,
+            );
+            object.append_section_data(section, b"metadata", 1);
+        });
+        let rlib = archive(&[
+            ("lib.rmeta", &metadata_object),
+            ("helper.o", &callee_object()),
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let rlib_path = dir.path().join("libhelper.rlib");
+        std::fs::write(&rlib_path, rlib).unwrap();
+
+        let bytes = link(
+            &[caller_object(), symbols_object],
+            &[rlib_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let file = parse_output(&bytes);
+
+        let helper = u32::try_from(file.symbol_by_name("helper").unwrap().address()).unwrap();
+        assert_eq!(bytes_at(&file, "_start", 8), &chain_for(helper));
+    }
+
+    #[test]
+    fn foreign_objects_with_code_are_rejected() {
+        let foreign_code = elf32_object_with(FOREIGN_MACHINE, |object| {
+            let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+            object.append_section_data(text, &[0; 4], 4);
+        });
+
+        let err = link(&[caller_object(), callee_object(), foreign_code], &[]).unwrap_err();
+        let message = format!("{err:?}");
+        assert!(message.contains("0xfeed"), "{message}");
     }
 }

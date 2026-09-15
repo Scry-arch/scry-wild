@@ -504,7 +504,9 @@ pub(crate) mod output_section_id {
 
 #[derive(derive_more::Debug)]
 pub(crate) struct File<'data, C: ElfClass> {
-    pub(crate) arch: Architecture,
+    /// The architecture of the object, or `None` if the object contains nothing
+    /// architecture-specific. See `is_architecture_neutral`.
+    pub(crate) arch: Option<Architecture>,
     #[debug(skip)]
     pub(crate) data: &'data [u8],
     #[debug(skip)]
@@ -3076,7 +3078,29 @@ fn load_glibc_abi_dt_relr_version<C: ElfClass>(
     Ok(())
 }
 
+/// Returns whether an object with the supplied sections contains nothing architecture-specific,
+/// i.e. no allocatable sections and no relocations. Such objects can be linked regardless of
+/// their machine number. rustc emits objects like this, tagged with whatever machine number it
+/// associates with the target, which isn't necessarily the one used by the code objects: the
+/// `symbols.o` it passes to the linker holds only symbol references and the metadata members it
+/// puts in rlibs hold only non-allocatable sections.
+fn is_architecture_neutral<C: ElfClass>(sections: &SectionTable<'_, C>) -> bool {
+    sections.iter().all(|section| {
+        !platform::SectionHeader::is_alloc(section)
+            && !matches!(
+                section.sh_type(LittleEndian),
+                object::elf::SHT_RELA | object::elf::SHT_REL
+            )
+    })
+}
+
 impl<'data, C: ElfClass> File<'data, C> {
+    /// Returns whether the object contains nothing architecture-specific. See
+    /// `is_architecture_neutral`.
+    fn is_architecture_neutral(&self) -> bool {
+        is_architecture_neutral::<C>(&self.sections)
+    }
+
     fn parse_elf_bytes(data: &'data [u8], is_dynamic: bool) -> Result<Self> {
         // The object crate rejects a header of the wrong class with a generic "unsupported"
         // error, so check the class ourselves first in order to give a useful message.
@@ -3094,8 +3118,12 @@ impl<'data, C: ElfClass> File<'data, C> {
 
         let header = C::FileHeader::parse(data)?;
         let endian = header.endian()?;
-        let architecture = header.e_machine(endian).try_into()?;
         let sections = header.sections(endian, data)?;
+        let arch = match Architecture::try_from(header.e_machine(endian)) {
+            Ok(arch) => Some(arch),
+            Err(_) if is_architecture_neutral::<C>(&sections) => None,
+            Err(error) => return Err(error),
+        };
         let eflags = header.e_flags(endian);
 
         let mut symbols = SymbolTable::<C>::default();
@@ -3134,7 +3162,7 @@ impl<'data, C: ElfClass> File<'data, C> {
             is_dynamic.then(|| DynamicTagValues::read::<C>(&sections, data, &symbols));
 
         Ok(Self {
-            arch: architecture,
+            arch,
             data,
             sections,
             symbols,
@@ -3154,15 +3182,21 @@ impl<'data, C: ElfClass> platform::ObjectFile<'data> for File<'data, C> {
     fn parse(input: &InputBytes<'data>, args: &ElfArgs) -> Result<Self> {
         let is_dynamic = input.kind == FileKind::ElfDynamic;
 
-        let file = Self::parse_bytes(input.data, is_dynamic)?;
+        let mut file = Self::parse_bytes(input.data, is_dynamic)?;
 
-        if file.arch != args.architecture() {
-            bail!(
-                "`{}` has incompatible architecture: {}, expecting {}",
-                input,
-                file.arch,
-                args.architecture(),
-            )
+        if let Some(arch) = file.arch
+            && arch != args.architecture()
+        {
+            if file.is_architecture_neutral() {
+                file.arch = None;
+            } else {
+                bail!(
+                    "`{}` has incompatible architecture: {}, expecting {}",
+                    input,
+                    arch,
+                    args.architecture(),
+                )
+            }
         }
 
         Ok(file)
@@ -4534,7 +4568,12 @@ fn merge_eflags<'files, 'data: 'files, C: ElfClass, A: Arch<Platform = Elf<C>>>(
 ) -> Result<object::elf::FileFlags> {
     timing_phase!("Merge e_flags");
 
-    A::merge_eflags(objects.map(|object| object.eflags))
+    // Architecture-neutral objects carry flags for some other architecture, so leave them out.
+    A::merge_eflags(
+        objects
+            .filter(|object| object.arch.is_some())
+            .map(|object| object.eflags),
+    )
 }
 
 fn merge_riscv_attributes<'groups, 'data: 'groups, C: ElfClass, A: Arch>(
@@ -6849,7 +6888,7 @@ impl CopyRelocationInfo {
 /// contexts that aren't currently generic over Arch.
 fn thunk_config_for_object<C: ElfClass>(file: &File<'_, C>) -> Option<ThunkConfig> {
     match file.arch {
-        crate::arch::Architecture::AArch64 => crate::elf_aarch64::ElfAArch64::thunk_config(),
+        Some(crate::arch::Architecture::AArch64) => crate::elf_aarch64::ElfAArch64::thunk_config(),
         _ => None,
     }
 }
@@ -6899,7 +6938,7 @@ mod tests {
         let bytes = elf_object_with_symbol(object::Architecture::X86_64_X32);
         let file = File::<Class32>::parse_bytes(&bytes, false).unwrap();
 
-        assert_eq!(file.arch, Architecture::X86_64);
+        assert_eq!(file.arch, Some(Architecture::X86_64));
 
         let (_, section) = file.section_by_name(".text").unwrap();
         assert_eq!(section.sh_size(LittleEndian), 4);
@@ -6929,5 +6968,101 @@ mod tests {
             format!("{err:?}").contains("Input is ELF64 but the output is ELF32"),
             "{err:?}"
         );
+    }
+
+    /// A machine number that no architecture uses.
+    const FOREIGN_MACHINE: object::elf::Machine = object::elf::Machine(0xfeed);
+
+    /// Builds an ELF32 object tagged with a machine number that wild doesn't support.
+    fn foreign_object(build: impl FnOnce(&mut object::write::Object)) -> Vec<u8> {
+        let mut object = object::write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64_X32,
+            object::Endianness::Little,
+        );
+        build(&mut object);
+        let mut bytes = object.write().unwrap();
+
+        const E_MACHINE_OFFSET: usize = 18;
+        bytes[E_MACHINE_OFFSET..E_MACHINE_OFFSET + 2]
+            .copy_from_slice(&FOREIGN_MACHINE.0.to_le_bytes());
+
+        bytes
+    }
+
+    #[test]
+    fn foreign_objects_without_content_are_architecture_neutral() {
+        // Like the `symbols.o` that rustc passes to the linker: only symbol references.
+        let symbols_only = foreign_object(|object| {
+            object.add_symbol(object::write::Symbol {
+                name: b"_start".to_vec(),
+                value: 0,
+                size: 0,
+                kind: object::SymbolKind::Unknown,
+                scope: object::SymbolScope::Dynamic,
+                weak: false,
+                section: object::write::SymbolSection::Undefined,
+                flags: object::SymbolFlags::None,
+            });
+        });
+        let file = File::<Class32>::parse_bytes(&symbols_only, false).unwrap();
+        assert_eq!(file.arch, None);
+
+        // Like the `lib.rmeta` member of a Rust rlib: a single non-allocatable section.
+        let metadata_only = foreign_object(|object| {
+            let section = object.add_section(
+                Vec::new(),
+                b".rmeta".to_vec(),
+                object::SectionKind::Metadata,
+            );
+            object.append_section_data(section, b"metadata", 1);
+        });
+        let file = File::<Class32>::parse_bytes(&metadata_only, false).unwrap();
+        assert_eq!(file.arch, None);
+    }
+
+    #[test]
+    fn foreign_objects_with_content_are_rejected() {
+        let with_code = foreign_object(|object| {
+            let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+            object.append_section_data(text, &[0; 4], 4);
+        });
+        let err = File::<Class32>::parse_bytes(&with_code, false).unwrap_err();
+        assert!(format!("{err:?}").contains("0xfeed"), "{err:?}");
+
+        // Relocations are architecture-specific even when they're in a non-allocatable section.
+        let with_relocations = foreign_object(|object| {
+            let debug = object.add_section(
+                Vec::new(),
+                b".debug_info".to_vec(),
+                object::SectionKind::Debug,
+            );
+            object.append_section_data(debug, &[0; 4], 1);
+            let symbol = object.add_symbol(object::write::Symbol {
+                name: b"foo".to_vec(),
+                value: 0,
+                size: 0,
+                kind: object::SymbolKind::Unknown,
+                scope: object::SymbolScope::Dynamic,
+                weak: false,
+                section: object::write::SymbolSection::Undefined,
+                flags: object::SymbolFlags::None,
+            });
+            object
+                .add_relocation(
+                    debug,
+                    object::write::Relocation {
+                        offset: 0,
+                        symbol,
+                        addend: 0,
+                        flags: object::RelocationFlags::Elf {
+                            r_type: object::elf::RelocationType(1),
+                        },
+                    },
+                )
+                .unwrap();
+        });
+        let err = File::<Class32>::parse_bytes(&with_relocations, false).unwrap_err();
+        assert!(format!("{err:?}").contains("0xfeed"), "{err:?}");
     }
 }
