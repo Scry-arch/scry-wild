@@ -5,5 +5,6 @@ pub mod loongarch64;
 pub mod ppc64;
 pub mod relaxation;
 pub mod riscv64;
+pub mod scry32;
 pub mod utils;
 pub mod x86_64;

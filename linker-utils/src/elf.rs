@@ -755,6 +755,12 @@ impl DynamicRelocationKind {
         };
         Some(kind)
     }
+
+    /// Scry executables are always static, so no Scry relocation type is a dynamic relocation.
+    #[must_use]
+    pub fn from_scry32_r_type(_r_type: object::elf::RelocationType) -> Option<Self> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]

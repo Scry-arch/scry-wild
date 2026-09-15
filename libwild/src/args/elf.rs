@@ -300,6 +300,8 @@ enum Emulation {
     LoongArch64,
     #[strum(serialize = "elf64lppc", message = "PowerPC64 LE ELF target")]
     Ppc64,
+    #[strum(serialize = "elf32scry", message = "Scry 32-bit ELF target")]
+    Scry32,
     #[strum(disabled)]
     Unsupported,
 }
@@ -312,6 +314,7 @@ impl Emulation {
             Emulation::RiscV64 => Architecture::RiscV64,
             Emulation::LoongArch64 => Architecture::LoongArch64,
             Emulation::Ppc64 => Architecture::Ppc64,
+            Emulation::Scry32 => Architecture::Scry32,
             Emulation::Unsupported => Architecture::Unsupported,
         }
     }
@@ -487,6 +490,7 @@ impl ElfArgs {
             Architecture::RiscV64 => Emulation::RiscV64,
             Architecture::LoongArch64 => Emulation::LoongArch64,
             Architecture::Ppc64 => Emulation::Ppc64,
+            Architecture::Scry32 => Emulation::Scry32,
             Architecture::Unsupported => Emulation::Unsupported,
         });
     }
@@ -2143,6 +2147,7 @@ impl platform::Args for ElfArgs {
             Architecture::RiscV64 => Alignment { exponent: 12 },
             Architecture::LoongArch64 => Alignment { exponent: 16 },
             Architecture::Ppc64 => Alignment { exponent: 16 },
+            Architecture::Scry32 => Alignment { exponent: 12 },
             Architecture::Unsupported => unreachable!(),
         }
     }
@@ -2593,5 +2598,21 @@ mod tests {
             args.start_address_for_section(SectionName(b".text")),
             Some(0x600000)
         );
+    }
+
+    #[test]
+    fn test_scry32_emulation() {
+        let args = parse_args(["-m", "elf32scry"]);
+        assert_eq!(args.architecture(), crate::arch::Architecture::Scry32);
+
+        assert!(
+            super::supported_emulations()
+                .split(' ')
+                .any(|emulation| emulation == "elf32scry")
+        );
+
+        let mut args = ElfArgs::new().unwrap();
+        args.set_architecture(crate::arch::Architecture::Scry32);
+        assert_eq!(args.architecture(), crate::arch::Architecture::Scry32);
     }
 }

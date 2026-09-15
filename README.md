@@ -153,6 +153,7 @@ The following platforms / architectures are currently supported:
 * RISC-V (riscv64gc) on Linux
 * LoongArch64 on Linux (initial support)
 * PPC64LE on Linux (initial support)
+* Scry 32-bit, bare metal (initial support)
 
 The following is working with the caveat that there may be bugs:
 
