@@ -842,17 +842,28 @@ pub enum Ppc64Instruction {
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum Scry32Instruction {
+    /// A `const` instruction followed by three `grow` instructions, together materialising a
+    /// 32-bit value. Each of the four 16-bit instruction words carries one byte of the value in
+    /// its high byte, most significant byte first.
+    ConstGrowChain,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum RelocationInstruction {
     AArch64(AArch64Instruction),
     RiscV(RiscVInstruction),
     LoongArch64(LoongArch64Instruction),
     Ppc64(Ppc64Instruction),
+    Scry32(Scry32Instruction),
 }
 
 impl RelocationInstruction {
+    /// Returns a mask covering `write_windows_size` bytes, with zero bits wherever the relocation
+    /// writes and one bits everywhere else.
     #[must_use]
-    pub fn bit_mask(&self, range: BitRange) -> [u8; 4] {
-        let mut mask = [0; 4];
+    pub fn bit_mask(&self, range: BitRange) -> Vec<u8> {
+        let mut mask = vec![0; self.write_windows_size()];
 
         // To figure out which bits are part of the relocation, we write a value with
         // all ones into a buffer that initially contains zeros.
@@ -873,11 +884,12 @@ impl RelocationInstruction {
             Self::RiscV(insn) => insn.write_to_value(extracted_value, negative, dest),
             Self::LoongArch64(insn) => insn.write_to_value(extracted_value, negative, dest),
             Self::Ppc64(insn) => insn.write_to_value(extracted_value, negative, dest),
+            Self::Scry32(insn) => insn.write_to_value(extracted_value, negative, dest),
         }
     }
 
     /// The inverse of `write_to_value`. Returns `(extracted_value, negative)`. Supplied `bytes`
-    /// must be at least 4 bytes, otherwise we panic.
+    /// must be at least `write_windows_size` bytes, otherwise we panic.
     #[must_use]
     pub fn read_value(self, bytes: &[u8]) -> (u64, bool) {
         match self {
@@ -885,6 +897,7 @@ impl RelocationInstruction {
             Self::RiscV(insn) => insn.read_value(bytes),
             Self::LoongArch64(insn) => insn.read_value(bytes),
             Self::Ppc64(insn) => insn.read_value(bytes),
+            Self::Scry32(insn) => insn.read_value(bytes),
         }
     }
 
@@ -896,6 +909,7 @@ impl RelocationInstruction {
             Self::RiscV(..) => 4,
             Self::LoongArch64(..) => 4,
             Self::Ppc64(..) => 4,
+            Self::Scry32(insn) => insn.write_windows_size(),
         }
     }
 }

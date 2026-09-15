@@ -68,7 +68,7 @@ pub(crate) trait Arch: Clone + Copy + Eq + PartialEq + Debug {
                     }
                 }
                 linker_utils::elf::RelocationSize::BitMasking(BitMask { range, instruction }) => {
-                    mask.bitmask = Vec::from(instruction.bit_mask(range));
+                    mask.bitmask = instruction.bit_mask(range);
                 }
             }
         }

@@ -292,4 +292,275 @@ mod tests {
         // Nothing in a static Scry executable should require a dynamic loader.
         assert!(file.section_by_name(".dynamic").is_none());
     }
+
+    /// A `const` instruction (type field set) followed by three `grow` instructions, with the
+    /// immediates zeroed. This is what the compiler emits at the site of an `R_SCRY_ABS32`.
+    const CHAIN: [u8; 8] = [0x90, 0, 0xc0, 0, 0xc0, 0, 0xc0, 0];
+
+    /// The chain with `address` filled in, most significant byte first.
+    fn chain_for(address: u32) -> [u8; 8] {
+        let [b0, b1, b2, b3] = address.to_be_bytes();
+        [0x90, b0, 0xc0, b1, 0xc0, b2, 0xc0, b3]
+    }
+
+    /// Builds a relocatable ELF32 Scry object using the supplied function to populate it.
+    fn scry32_object_with(build: impl FnOnce(&mut object::write::Object)) -> Vec<u8> {
+        let mut object = object::write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64_X32,
+            object::Endianness::Little,
+        );
+        build(&mut object);
+        let mut bytes = object.write().unwrap();
+
+        const E_MACHINE_OFFSET: usize = 18;
+        bytes[E_MACHINE_OFFSET..E_MACHINE_OFFSET + 2].copy_from_slice(&EM_SCRY.0.to_le_bytes());
+
+        bytes
+    }
+
+    fn global_symbol(
+        name: &str,
+        section: object::write::SectionId,
+        value: u64,
+        size: u64,
+        kind: object::SymbolKind,
+    ) -> object::write::Symbol {
+        object::write::Symbol {
+            name: name.as_bytes().to_vec(),
+            value,
+            size,
+            kind,
+            scope: object::SymbolScope::Dynamic,
+            weak: false,
+            section: object::write::SymbolSection::Section(section),
+            flags: object::SymbolFlags::None,
+        }
+    }
+
+    fn undefined_symbol(name: &str) -> object::write::Symbol {
+        object::write::Symbol {
+            name: name.as_bytes().to_vec(),
+            value: 0,
+            size: 0,
+            kind: object::SymbolKind::Unknown,
+            scope: object::SymbolScope::Dynamic,
+            weak: false,
+            section: object::write::SymbolSection::Undefined,
+            flags: object::SymbolFlags::None,
+        }
+    }
+
+    fn relocation(
+        offset: u64,
+        symbol: object::write::SymbolId,
+        addend: i64,
+        r_type: RelocationType,
+    ) -> object::write::Relocation {
+        object::write::Relocation {
+            offset,
+            symbol,
+            addend,
+            flags: object::RelocationFlags::Elf { r_type },
+        }
+    }
+
+    /// Links the supplied objects into a static executable and returns its bytes.
+    fn link(objects: &[Vec<u8>], extra_args: &[&str]) -> crate::error::Result<Vec<u8>> {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("out");
+        let input_paths = objects
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let path = dir.path().join(format!("{i}.o"));
+                std::fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let mut args = vec!["-m", "elf32scry", "-z", "noexecstack"];
+        args.extend_from_slice(extra_args);
+        args.extend(["-o", output_path.to_str().unwrap()]);
+        args.extend(input_paths.iter().map(|p| p.to_str().unwrap()));
+
+        let mut elf_args = ElfArgs::new().unwrap();
+        elf_args.parse(args.into_iter()).unwrap();
+        let args = crate::args::Args::Elf(elf_args);
+
+        let linker = crate::Linker::new();
+        let output = linker.run(&args)?;
+        drop(output);
+        drop(linker);
+
+        Ok(std::fs::read(&output_path).unwrap())
+    }
+
+    /// An object whose `_start` materialises `helper` and `helper + 4` in two chains.
+    fn caller_object() -> Vec<u8> {
+        scry32_object_with(|object| {
+            let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+            let mut code = CHAIN.to_vec();
+            code.extend_from_slice(&CHAIN);
+            object.append_section_data(text, &code, 2);
+            object.add_symbol(global_symbol(
+                "_start",
+                text,
+                0,
+                16,
+                object::SymbolKind::Text,
+            ));
+            let helper = object.add_symbol(undefined_symbol("helper"));
+            object
+                .add_relocation(
+                    text,
+                    relocation(0, helper, 0, linker_utils::scry32::R_SCRY_ABS32),
+                )
+                .unwrap();
+            object
+                .add_relocation(
+                    text,
+                    relocation(8, helper, 4, linker_utils::scry32::R_SCRY_ABS32),
+                )
+                .unwrap();
+        })
+    }
+
+    /// An object defining `helper` and `unused`, each in its own section.
+    fn callee_object() -> Vec<u8> {
+        scry32_object_with(|object| {
+            let helper_section = object.add_section(
+                Vec::new(),
+                b".text.helper".to_vec(),
+                object::SectionKind::Text,
+            );
+            object.append_section_data(helper_section, &[0x01, 0x00, 0x01, 0x00], 2);
+            object.add_symbol(global_symbol(
+                "helper",
+                helper_section,
+                0,
+                4,
+                object::SymbolKind::Text,
+            ));
+
+            let unused_section = object.add_section(
+                Vec::new(),
+                b".text.unused".to_vec(),
+                object::SectionKind::Text,
+            );
+            object.append_section_data(unused_section, &[0x01, 0x00], 2);
+            object.add_symbol(global_symbol(
+                "unused",
+                unused_section,
+                0,
+                2,
+                object::SymbolKind::Text,
+            ));
+        })
+    }
+
+    fn parse_output(bytes: &[u8]) -> object::read::elf::ElfFile32<'_, object::LittleEndian> {
+        object::read::elf::ElfFile32::<object::LittleEndian>::parse(bytes).unwrap()
+    }
+
+    /// Returns `len` bytes of the output starting at `symbol`.
+    fn bytes_at<'a>(
+        file: &'a object::read::elf::ElfFile32<'_, object::LittleEndian>,
+        symbol: &str,
+        len: usize,
+    ) -> &'a [u8] {
+        let symbol = file.symbol_by_name(symbol).unwrap();
+        let section = file
+            .section_by_index(symbol.section_index().unwrap())
+            .unwrap();
+        let offset = (symbol.address() - section.address()) as usize;
+        &section.data().unwrap()[offset..offset + len]
+    }
+
+    #[test]
+    fn abs32_relocations_materialise_symbol_addresses() {
+        let bytes = link(&[caller_object(), callee_object()], &[]).unwrap();
+        let file = parse_output(&bytes);
+
+        let helper = u32::try_from(file.symbol_by_name("helper").unwrap().address()).unwrap();
+        assert_ne!(helper, 0);
+
+        let mut expected = chain_for(helper).to_vec();
+        expected.extend_from_slice(&chain_for(helper + 4));
+        assert_eq!(bytes_at(&file, "_start", 16), &expected[..]);
+    }
+
+    #[test]
+    fn r_scry_32_relocations_write_pointers_in_data() {
+        let data_object = scry32_object_with(|object| {
+            let data = object.add_section(Vec::new(), b".data".to_vec(), object::SectionKind::Data);
+            object.append_section_data(data, &[0; 8], 4);
+            let table =
+                object.add_symbol(global_symbol("table", data, 0, 8, object::SymbolKind::Data));
+            let helper = object.add_symbol(undefined_symbol("helper"));
+
+            // `_start` materialises the address of `table`, which keeps `.data` alive: wild
+            // garbage-collects unreferenced sections by default.
+            let text = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+            object.append_section_data(text, &CHAIN, 2);
+            object.add_symbol(global_symbol(
+                "_start",
+                text,
+                0,
+                8,
+                object::SymbolKind::Text,
+            ));
+            object
+                .add_relocation(
+                    text,
+                    relocation(0, table, 0, linker_utils::scry32::R_SCRY_ABS32),
+                )
+                .unwrap();
+
+            object
+                .add_relocation(
+                    data,
+                    relocation(0, helper, 0, linker_utils::scry32::R_SCRY_32),
+                )
+                .unwrap();
+            object
+                .add_relocation(
+                    data,
+                    relocation(4, helper, -2, linker_utils::scry32::R_SCRY_32),
+                )
+                .unwrap();
+        });
+
+        let bytes = link(&[data_object, callee_object()], &[]).unwrap();
+        let file = parse_output(&bytes);
+
+        let helper = u32::try_from(file.symbol_by_name("helper").unwrap().address()).unwrap();
+        let mut expected = helper.to_le_bytes().to_vec();
+        expected.extend_from_slice(&(helper - 2).to_le_bytes());
+        assert_eq!(bytes_at(&file, "table", 8), &expected[..]);
+    }
+
+    #[test]
+    fn gc_sections_keeps_functions_reached_through_abs32() {
+        let bytes = link(&[caller_object(), callee_object()], &["--gc-sections"]).unwrap();
+        let file = parse_output(&bytes);
+
+        let helper = file
+            .symbol_by_name("helper")
+            .expect("helper is referenced from _start");
+        assert!(
+            file.symbol_by_name("unused").is_none(),
+            "unused should be discarded"
+        );
+
+        let helper = u32::try_from(helper.address()).unwrap();
+        assert_eq!(bytes_at(&file, "_start", 8), &chain_for(helper));
+    }
+
+    #[test]
+    fn unresolved_symbols_are_reported() {
+        let err = link(&[caller_object()], &[]).unwrap_err();
+        let message = format!("{err:?}");
+        assert!(message.contains("helper"), "{message}");
+    }
 }
